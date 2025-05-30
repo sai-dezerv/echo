@@ -1,137 +1,25 @@
 import os
-import json
-import requests
 from dotenv import load_dotenv
-from openai import OpenAI
-from flask import Flask, request, jsonify
-from pydantic import BaseModel, Field
-
-from agents.test_agent_1 import get_weather_tool
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from agents import Agent, handoff, Runner, function_tool
+from pydantic import BaseModel
+import asyncio
+import uvicorn
+import json
 
 load_dotenv()
-app = Flask(__name__)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+app = FastAPI()
 
-@app.route('/ask', methods=['POST'])
-def ask():
-    user_question = request.json.get('question')
-    # Send the question to OpenAI with a prompt to return a structured response
-    system_prompt = (
-        "You are Echo, Dezerv's Personal Financial Companion."
-        "You can use the following tools to answer user questions:"
-        "1. portfolio_tool: Get portfolio details for a user."
-        "2. strategy_tool: Get strategy details basis strategy data."
-        "Use the tools to gather information and provide a structured response."
-        "If the user asks about their portfolio, use the portfolio_tool to get the details."
-        "Do not answer the question directly."
-    )
-    tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": "portfolio_tool",
-                "description": "Get portfolio details for a user.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "user_id": {"type": "string", "description": "The ID of the user."},
-                    },
-                    "required": ["user_id"],
-                    "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "strategy_tool",
-                "description": "Get investment strategy details for a user.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "strategy_id": {"type": "string", "description": "The ID of the user."},
-                    },
-                    "required": ["strategy_id"],
-                    "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        }
-    ]
+# Define the tool agents
+class PortfolioInput(BaseModel):
+    user_id: str
 
-    system_prompt = "You are a helpful weather assistant."
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_question},
-        {"role": "assistant", "content": "Sure, I can help with that. Let me check your portfolio details."}
-    ]
-    completion = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        tools=tools,
-    )
-    completion.model_dump()
-
-    def call_function(name, args):
-        if name == "portfolio_tool":
-            print(f"Calling portfolio_tool with args: {args}")
-            return portfolio_tool(**args)
-        elif name == "strategy_tool":
-            print(f"Calling strategy_tool with args: {args}")
-            return strategy_tool(**args)
-        else:
-            print(f"Unknown function: {name}")
-            raise ValueError(f"Unknown function: {name}")
-
-
-    for tool_call in completion.choices[0].message.tool_calls:
-        name = tool_call.function.name
-        args = json.loads(tool_call.function.arguments)
-        messages.append(completion.choices[0].message)
-
-        result = call_function(name, args)
-        messages.append(
-            {"role": "tool", "tool_call_id": tool_call.id, "content": json.dumps(result)}
-        )
-
-    class GenericResponse(BaseModel):
-        # confidence: float = Field(
-        #     description="Confidence level of the response, between 0 and 1."
-        # )
-        response: str = Field(
-            description="A natural language response to the user's question."
-        )
-
-
-    completion_2 = client.beta.chat.completions.parse(
-        model="gpt-4o-mini",
-        messages=messages,
-        tools=tools,
-        response_format=GenericResponse,
-    )
-
-    print(completion_2)
-
-    final_response = completion_2.choices[0].message.parsed
-    print("Final Response:", final_response)
-    # print(final_response.confidence)
-    print(final_response.response)
-
-    return jsonify({
-        # "confidence": final_response.confidence,
-        "response": final_response.response
-    }
-
-)
-    
-
-def portfolio_tool(user_id):
+@function_tool
+def portfolio_tool(input_data: PortfolioInput):
     """Mock function to simulate portfolio details retrieval."""
-    # In a real application, this would query a database or an external service.
     return {
-        "user_id": user_id,
+        "user_id": input_data.user_id,
         "portfolio_value": 100000,
         "investments": [
             {"name": "Swiggy Stock", "value": 50000},
@@ -139,12 +27,15 @@ def portfolio_tool(user_id):
             {"name": "Real Estate C", "value": 20000}
         ]
     }
-    
-def strategy_tool(strategy_id):
+
+class StrategyInput(BaseModel):
+    strategy_id: str
+
+@function_tool
+def strategy_tool(input_data: StrategyInput):
     """Mock function to simulate strategy details retrieval."""
-    # In a real application, this would query a database or an external service.
     return {
-        "strategy_id": strategy_id,
+        "strategy_id": input_data.strategy_id,
         "strategy": "ERS",
         "risk_tolerance": "Medium",
         "investment_horizon": "5 years",
@@ -155,8 +46,76 @@ def strategy_tool(strategy_id):
         ]
     }
 
+portfolio_agent = Agent(
+    name="Portfolio Agent",
+    instructions="Handles portfolio queries.",
+    tools=[portfolio_tool],
+    model="gpt-4o-mini",
+)
+
+strategy_agent = Agent(
+    name="Strategy Agent",
+    instructions="Handles investment strategy queries.",
+    tools=[strategy_tool],
+    model="gpt-4o-mini",
+)
+
+# Main agent with handoffs
+main_agent = Agent(
+    name="Dezerv's Personal Financial Companion",
+
+    instructions="""
+        You are Echo, Dezerv's Personal Financial Companion. 
+        Do not answer questions directly unless you have the information from the tools.
+        Handoff to the appropriate agent based on the user's question.
+        1. If the user asks about their portfolio, use the portfolio_agent. 
+        2. If the user asks about investment strategy, use the strategy_agent.
+    """,
+    handoffs=[
+        portfolio_agent,
+        strategy_agent,
+    ],
+)
+
+@app.post('/ask')
+async def ask(request: Request):
+    data = await request.json()
+    user_question = data.get('question')
+    userDataAvailable = data.get('userDataAvailable', {})
+    if userDataAvailable:
+        user_question += " User Data Available: " + json.dumps(userDataAvailable)
+    if not user_question:
+        return JSONResponse({"error": "No question provided"}, status_code=400)
+    if not isinstance(user_question, str):
+        return JSONResponse({"error": "Question must be a string"}, status_code=400)
+    try:
+        result = await call_runner(main_agent, user_question)
+        print(result)
+    except asyncio.CancelledError:
+        return JSONResponse({"error": "Request was cancelled"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    
+    return JSONResponse(
+        content={
+            "question": user_question,
+            "response": result.final_output
+        },
+        status_code=200
+    )
+
+async def call_runner(agent, question):
+    """Call the agent runner with the provided question."""
+    
+    try:
+        result = await Runner.run(agent, question, max_turns=5)
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+    
 if __name__ == "__main__":
-    app.run(debug=True)
+    # For development, run: uvicorn app:app --reload
+    pass
 
 # Transaction statement:
 # Statement Of Expense
